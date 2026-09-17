@@ -20,7 +20,7 @@ let JWT_EXPIRATION = null;
 let opts = null;
 let saltRounds = 10;
 
-exports.initialize = function () {
+exports.initialize = async function () {
   /*************************
    * Authentication module
    ************************/
@@ -43,11 +43,11 @@ exports.initialize = function () {
   }
 
   SERVER_SECRET = null;
-  if (db_api.users_db.get('jwt_secret').value()) {
-    SERVER_SECRET = db_api.users_db.get('jwt_secret').value();
+  if (await db_api.getSetting('jwt_secret')) {
+    SERVER_SECRET = await db_api.getSetting('jwt_secret');
   } else {
     SERVER_SECRET = uuid();
-    db_api.users_db.set('jwt_secret', SERVER_SECRET).write();
+    await db_api.setSetting('jwt_secret', SERVER_SECRET);
   }
 
   opts = {}

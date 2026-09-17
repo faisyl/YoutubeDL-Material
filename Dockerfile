@@ -55,6 +55,9 @@ RUN rm -rf node_modules
 FROM base as backend
 WORKDIR /app
 COPY [ "backend/","/app/" ]
+# better-sqlite3 requires native compilation (build-essential, python3)
+RUN apt update && apt install -y --no-install-recommends build-essential python3 && \
+    apt clean && rm -rf /var/lib/apt/lists/*
 RUN npm config set strict-ssl false && \
     npm install --prod && \
     ls -al

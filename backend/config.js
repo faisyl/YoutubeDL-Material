@@ -268,7 +268,9 @@ const DEFAULT_CONFIG = {
       },
       "Database": {
         "use_local_db": true,
-        "mongodb_connection_string": "mongodb://127.0.0.1:27017/?compressors=zlib"
+        "mongodb_connection_string": "mongodb://127.0.0.1:27017/?compressors=zlib",
+        "sqlite_path": "./appdata/local_db.sqlite",
+        "auto_migrate_json": true
       },
       "Advanced": {
         "default_downloader": "yt-dlp",
