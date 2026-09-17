@@ -59,42 +59,9 @@ config_api.initialize();
 db_api.initialize();
 auth_api.initialize(db_api);
 
-// Set some defaults
+// SQLite handles defaults through schema initialization in db.js
 
-    {
-        playlists: [],
-        files: [],
-        configWriteFlag: false,
-        downloads: {},
-        subscriptions: [],
-        files_to_db_migration_complete: false,
-        tasks_manager_role_migration_complete: false,
-        archives_migration_complete: false
-}).write();
 
-users_
-    {
-        users: [],
-        roles: {
-            "admin": {
-                "permissions": [
-                    'filemanager',
-                    'settings',
-                    'subscriptions',
-                    'sharing',
-                    'advanced_download',
-                    'downloads_manager'
-                ]
-            }, "user": {
-                "permissions": [
-                    'filemanager',
-                    'subscriptions',
-                    'sharing'
-                ]
-            }
-        }
-    }
-).write();
 
 // config values
 let url = null;

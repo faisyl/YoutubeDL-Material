@@ -107,6 +107,21 @@ function initSQLite(sqlitePath) {
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
 
+    // Register a regex UDF so $regex filters use real JS RegExp, not LIKE
+    db.function('regexp', (pattern, text) => {
+        try {
+            const re = new RegExp(pattern);
+            return re.test(text) ? 1 : 0;
+        } catch (e) {
+            return 0;
+        }
+    });
+
+    // Register a Unicode-aware lowercase UDF for case-insensitive matching
+    db.function('unicode_lower', (text) => {
+        return text ? text.toLocaleLowerCase() : text;
+    });
+
     for (const table of Object.keys(createTableSQL)) {
         db.exec(createTableSQL[table]);
     }
@@ -184,11 +199,13 @@ function buildWhereClause(filter_obj) {
                 const regex = filter_prop_value['$regex'];
                 const options = filter_prop_value['$options'] || '';
                 if (options.includes('i')) {
-                    clauses.push(`lower(${col}) LIKE lower(?)`);
-                    params.push(`%${regex}%`);
+                    // Unicode-aware case-insensitive regex
+                    clauses.push(`regexp(?, ${col}) = 1`);
+                    params.push(regex);
                 } else {
-                    clauses.push(`${col} LIKE ?`);
-                    params.push(`%${regex}%`);
+                    // Case-sensitive regex
+                    clauses.push(`regexp(?, ${col}) = 1`);
+                    params.push(regex);
                 }
             } else if ('$ne' in filter_prop_value) {
                 clauses.push(`(${col} != ? OR ${col} IS NULL)`);
@@ -257,17 +274,39 @@ exports.initialize = (input_db, input_users_db, db_name = 'local_db.json') => {
                     fs.copySync(legacyUsersPath, `./appdata/users.json.${timestamp}.bak`);
                 }
                 
-                // Migrate
+                // Idempotency marker: write BEFORE import so a crash between
+                // SQLite init and insert doesn't skip migration and lose data.
+                // On restart, if SQLite exists but this marker is missing, we
+                // know the previous migration attempt was incomplete.
+                local_db.prepare('INSERT OR REPLACE INTO migration_meta (key, value) VALUES (?, ?)').run('sqlite_migration', JSON.stringify({ version: 1, status: 'in_progress', started_at: Date.now() }));
+                
+                // Migrate: wrap in a transaction so partial imports roll back cleanly.
                 const tables_obj = exports.generateJSONTables(db_json, users_json);
                 const table_keys = Object.keys(tables_obj);
-                for (const table_key of table_keys) {
-                    if (tables_obj[table_key] && tables_obj[table_key].length > 0) {
-                        exports.insertRecordsIntoTable(table_key, tables_obj[table_key], true);
+                const insertTransaction = local_db.transaction(() => {
+                    for (const table_key of table_keys) {
+                        if (tables_obj[table_key] && tables_obj[table_key].length > 0) {
+                            const keyCols = tables[table_key] ? (tables[table_key].primary_key ? [tables[table_key].primary_key] : []) : [];
+                            const textCols = tables[table_key] && tables[table_key].text_search ? Object.keys(tables[table_key].text_search) : [];
+                            const allKeyCols = [...new Set([...keyCols, ...textCols])];
+                            
+                            for (const doc of tables_obj[table_key]) {
+                                const keyValues = {};
+                                for (const k of allKeyCols) {
+                                    if (doc[k] !== undefined) keyValues[k] = doc[k];
+                                }
+                                const cols = ['body', ...Object.keys(keyValues)];
+                                const placeholders = cols.map(() => '?').join(',');
+                                const values = [JSON.stringify(doc), ...Object.values(keyValues)];
+                                local_db.prepare(`INSERT OR IGNORE INTO ${table_key} (${cols.join(',')}) VALUES (${placeholders})`).run(values);
+                            }
+                        }
                     }
-                }
+                });
+                insertTransaction();
                 
-                // Idempotency marker
-                local_db.prepare('INSERT OR REPLACE INTO migration_meta (key, value) VALUES (?, ?)').run('sqlite_migration', JSON.stringify({ version: 1, migrated_at: Date.now() }));
+                // Mark migration as complete
+                local_db.prepare('INSERT OR REPLACE INTO migration_meta (key, value) VALUES (?, ?)').run('sqlite_migration', JSON.stringify({ version: 1, status: 'complete', migrated_at: Date.now() }));
                 
                 // Rename legacy files
                 fs.renameSync(legacyDbPath, `./appdata/db.json.migrated`);
@@ -325,8 +364,6 @@ exports.connectToDB = async (retries = 5, no_fallback = false, custom_connection
 exports._connectToDB = async (custom_connection_string = null) => {
     const uri = !custom_connection_string ? config_api.getConfigItem('ytdl_mongodb_connection_string') : custom_connection_string;
     const client = new MongoClient(uri, {
-        useNewUrlParser: true,
-        useUnifiedTopology: true,
     });
 
     try {
