@@ -7,8 +7,7 @@ const config_api = require('./config');
 const utils = require('./utils')
 const logger = require('./logger');
 
-const low = require('lowdb')
-const FileSync = require('lowdb/adapters/FileSync');
+const Database = require('better-sqlite3');
 const { BehaviorSubject } = require('rxjs');
 
 let local_db = null;
@@ -79,18 +78,213 @@ function setDB(input_db, input_users_db) {
     exports.users_db = input_users_db
 }
 
+const createTableSQL = {
+    files: `CREATE TABLE IF NOT EXISTS files (uid TEXT PRIMARY KEY, title TEXT, uploader TEXT, body TEXT NOT NULL)`,
+    playlists: `CREATE TABLE IF NOT EXISTS playlists (id TEXT PRIMARY KEY, body TEXT NOT NULL)`,
+    categories: `CREATE TABLE IF NOT EXISTS categories (uid TEXT PRIMARY KEY, body TEXT NOT NULL)`,
+    subscriptions: `CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, body TEXT NOT NULL)`,
+    downloads: `CREATE TABLE IF NOT EXISTS downloads (key TEXT PRIMARY KEY, body TEXT NOT NULL)`,
+    users: `CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY, body TEXT NOT NULL)`,
+    roles: `CREATE TABLE IF NOT EXISTS roles (key TEXT PRIMARY KEY, body TEXT NOT NULL)`,
+    download_queue: `CREATE TABLE IF NOT EXISTS download_queue (uid TEXT PRIMARY KEY, body TEXT NOT NULL)`,
+    tasks: `CREATE TABLE IF NOT EXISTS tasks (key TEXT PRIMARY KEY, body TEXT NOT NULL)`,
+    notifications: `CREATE TABLE IF NOT EXISTS notifications (uid TEXT PRIMARY KEY, body TEXT NOT NULL)`,
+    archives: `CREATE TABLE IF NOT EXISTS archives (uid TEXT PRIMARY KEY, body TEXT NOT NULL)`,
+    test: `CREATE TABLE IF NOT EXISTS test (body TEXT NOT NULL)`,
+    migration_meta: `CREATE TABLE IF NOT EXISTS migration_meta (key TEXT PRIMARY KEY, value TEXT)`,
+    settings: `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`
+};
+
+const createIndexSQL = [
+    `CREATE INDEX IF NOT EXISTS idx_files_title ON files(title)`,
+    `CREATE INDEX IF NOT EXISTS idx_files_uploader ON files(uploader)`
+];
+
+function initSQLite(sqlitePath) {
+    const db = new Database(sqlitePath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
+    db.pragma('foreign_keys = ON');
+    db.pragma('busy_timeout = 5000');
+
+    for (const table of Object.keys(createTableSQL)) {
+        db.exec(createTableSQL[table]);
+    }
+    for (const idxSQL of createIndexSQL) {
+        db.exec(idxSQL);
+    }
+    return db;
+}
+
+function extractKeyColumns(table, doc) {
+    const tableDef = tables[table];
+    const cols = {};
+    if (tableDef && tableDef.primary_key) {
+        const pk = tableDef.primary_key;
+        if (doc[pk] !== undefined) cols[pk] = doc[pk];
+    }
+    // extract text_search columns
+    if (tableDef && tableDef.text_search) {
+        for (const col of Object.keys(tableDef.text_search)) {
+            if (doc[col] !== undefined) cols[col] = doc[col];
+        }
+    }
+    return cols;
+}
+
+function docToObject(row) {
+    if (!row) return null;
+    const obj = JSON.parse(row.body);
+    // restore PK columns that may not be in body
+    for (const key of ['uid', 'id', 'key']) {
+        if (row[key] !== undefined && obj[key] === undefined) {
+            obj[key] = row[key];
+        }
+    }
+    // restore text_search columns
+    if (row.title !== undefined && obj.title === undefined) obj.title = row.title;
+    if (row.uploader !== undefined && obj.uploader === undefined) obj.uploader = row.uploader;
+    return obj;
+}
+
+function jsonExtractPath(key) {
+    const path = '$.' + key.replace(/\./g, '.');
+    return path;
+}
+
+function buildWhereClause(filter_obj) {
+    if (!filter_obj) return { sql: '', params: [] };
+    const filter_props = Object.keys(filter_obj);
+    if (filter_props.length === 0) return { sql: '', params: [] };
+
+    const clauses = [];
+    const params = [];
+
+    for (const filter_prop of filter_props) {
+        const filter_prop_value = filter_obj[filter_prop];
+        const isDotPath = filter_prop.includes('.');
+        const colRef = isDotPath ? `json_extract(body, '${jsonExtractPath(filter_prop)}')` : 
+                      (filter_prop in (tables.files.primary_key ? {} : {}) ? filter_prop : null);
+
+        // determine column reference
+        let col;
+        if (isDotPath) {
+            col = `json_extract(body, '${jsonExtractPath(filter_prop)}')`;
+        } else if (['uid','id','key','title','uploader'].includes(filter_prop)) {
+            col = filter_prop;
+        } else {
+            col = `json_extract(body, '${jsonExtractPath(filter_prop)}')`;
+        }
+
+        if (filter_prop_value === undefined || filter_prop_value === null) {
+            // null/undefined: match missing or null
+            clauses.push(`(${col} IS NULL OR json_type(${col}) = 'null' OR json_extract(body, '${jsonExtractPath(filter_prop)}' ) IS NULL)`);
+        } else if (typeof filter_prop_value === 'object' && filter_prop_value !== null) {
+            if ('$regex' in filter_prop_value) {
+                const regex = filter_prop_value['$regex'];
+                const options = filter_prop_value['$options'] || '';
+                if (options.includes('i')) {
+                    clauses.push(`lower(${col}) LIKE lower(?)`);
+                    params.push(`%${regex}%`);
+                } else {
+                    clauses.push(`${col} LIKE ?`);
+                    params.push(`%${regex}%`);
+                }
+            } else if ('$ne' in filter_prop_value) {
+                clauses.push(`(${col} != ? OR ${col} IS NULL)`);
+                params.push(filter_prop_value['$ne']);
+            } else if ('$lt' in filter_prop_value) {
+                clauses.push(`${col} < ?`);
+                params.push(filter_prop_value['$lt']);
+            } else if ('$gt' in filter_prop_value) {
+                clauses.push(`${col} > ?`);
+                params.push(filter_prop_value['$gt']);
+            } else if ('$lte' in filter_prop_value) {
+                clauses.push(`${col} <= ?`);
+                params.push(filter_prop_value['$lte']);
+            } else if ('$gte' in filter_prop_value) {
+                clauses.push(`${col} >= ?`);
+                params.push(filter_prop_value['$gte']);
+            }
+        } else {
+            clauses.push(`${col} = ?`);
+            params.push(filter_prop_value);
+        }
+    }
+
+    return {
+        sql: clauses.length > 0 ? ' WHERE ' + clauses.join(' AND ') : '',
+        params
+    };
+}
+
+function getPrimaryKeyColumn(table) {
+    const tableDef = tables[table];
+    return tableDef && tableDef.primary_key ? tableDef.primary_key : null;
+}
+
 exports.initialize = (input_db, input_users_db, db_name = 'local_db.json') => {
     setDB(input_db, input_users_db);
 
     // must be done here to prevent getConfigItem from being called before init
     using_local_db = config_api.getConfigItem('ytdl_use_local_db');
 
-    const local_adapter = new FileSync(`./appdata/${db_name}`);
-    local_db = low(local_adapter);
-
-    const local_db_defaults = {}
-    tables_list.forEach(table => {local_db_defaults[table] = []});
-    local_db.defaults(local_db_defaults).write();
+    if (using_local_db) {
+        // SQLite mode
+        const sqlitePath = config_api.getConfigItem('ytdl_sqlite_path') || './appdata/local_db.sqlite';
+        
+        // Check if SQLite DB exists
+        if (fs.existsSync(sqlitePath)) {
+            // Already migrated
+            local_db = initSQLite(sqlitePath);
+            logger.info(`SQLite DB loaded from ${sqlitePath}`);
+        } else {
+            // Check for legacy JSON
+            const legacyDbPath = './appdata/db.json';
+            const legacyUsersPath = './appdata/users.json';
+            if (fs.existsSync(legacyDbPath) || fs.existsSync(legacyUsersPath)) {
+                logger.info('Legacy JSON detected, migrating to SQLite...');
+                local_db = initSQLite(sqlitePath);
+                
+                // Read legacy JSON
+                const db_json = fs.existsSync(legacyDbPath) ? fs.readJSONSync(legacyDbPath) : {};
+                const users_json = fs.existsSync(legacyUsersPath) ? fs.readJSONSync(legacyUsersPath) : { users: [], roles: {} };
+                
+                // Backup
+                const timestamp = Date.now() / 1000;
+                fs.copySync(legacyDbPath, `./appdata/db.json.${timestamp}.bak`);
+                if (fs.existsSync(legacyUsersPath)) {
+                    fs.copySync(legacyUsersPath, `./appdata/users.json.${timestamp}.bak`);
+                }
+                
+                // Migrate
+                const tables_obj = exports.generateJSONTables(db_json, users_json);
+                const table_keys = Object.keys(tables_obj);
+                for (const table_key of table_keys) {
+                    if (tables_obj[table_key] && tables_obj[table_key].length > 0) {
+                        exports.insertRecordsIntoTable(table_key, tables_obj[table_key], true);
+                    }
+                }
+                
+                // Idempotency marker
+                local_db.prepare('INSERT OR REPLACE INTO migration_meta (key, value) VALUES (?, ?)').run('sqlite_migration', JSON.stringify({ version: 1, migrated_at: Date.now() }));
+                
+                // Rename legacy files
+                fs.renameSync(legacyDbPath, `./appdata/db.json.migrated`);
+                if (fs.existsSync(legacyUsersPath)) {
+                    fs.renameSync(legacyUsersPath, `./appdata/users.json.migrated`);
+                }
+                logger.info('Migration to SQLite complete!');
+            } else {
+                // Fresh install
+                local_db = initSQLite(sqlitePath);
+                logger.info('Fresh SQLite DB created');
+            }
+        }
+    } else {
+        // MongoDB mode - no local DB needed; will fall back to SQLite if connection fails
+        logger.info('Using MongoDB mode');
+    }
 }
 
 exports.connectToDB = async (retries = 5, no_fallback = false, custom_connection_string = null) => {
@@ -122,12 +316,14 @@ exports.connectToDB = async (retries = 5, no_fallback = false, custom_connection
     }
     using_local_db = true;
     config_api.setConfigItem('ytdl_use_local_db', true);
-    logger.error('Failed to connect to MongoDB, using Local DB as a fallback. Make sure your MongoDB instance is accessible, or set Local DB as a default through the config.');
+    const sqlitePath = config_api.getConfigItem('ytdl_sqlite_path') || './appdata/local_db.sqlite';
+    local_db = initSQLite(sqlitePath);
+    logger.error('Failed to connect to MongoDB, using Local DB (SQLite) as a fallback. Make sure your MongoDB instance is accessible, or set Local DB as a default through the config.');
     return true;
 }
 
 exports._connectToDB = async (custom_connection_string = null) => {
-    const uri = !custom_connection_string ? config_api.getConfigItem('ytdl_mongodb_connection_string') : custom_connection_string; // "mongodb://127.0.0.1:27017/?compressors=zlib&gssapiServiceName=mongodb";
+    const uri = !custom_connection_string ? config_api.getConfigItem('ytdl_mongodb_connection_string') : custom_connection_string;
     const client = new MongoClient(uri, {
         useNewUrlParser: true,
         useUnifiedTopology: true,
@@ -137,7 +333,6 @@ exports._connectToDB = async (custom_connection_string = null) => {
         await client.connect();
         database = client.db('ytdl_material');
 
-        // avoid doing anything else if it's just a test
         if (custom_connection_string) return true;
 
         const existing_collections = (await database.listCollections({}, { nameOnly: true }).toArray()).map(collection => collection.name);
@@ -157,7 +352,7 @@ exports._connectToDB = async (custom_connection_string = null) => {
                 await database.collection(table).createIndex(text_search);
             }
         });
-        using_local_db = false; // needs to happen for tests (in normal operation using_local_db is guaranteed false)
+        using_local_db = false;
         return true;
     } catch(err) {
         logger.error(err);
@@ -169,14 +364,13 @@ exports._connectToDB = async (custom_connection_string = null) => {
 }
 
 exports.setVideoProperty = async (file_uid, assignment_obj) => {
-    // TODO: check if video exists, throw error if not
     await exports.updateRecord('files', {uid: file_uid}, assignment_obj);
 }
 
 exports.getFileDirectoriesAndDBs = async () => {
     let dirs_to_check = [];
     let subscriptions_to_check = [];
-    const subscriptions_base_path = config_api.getConfigItem('ytdl_subscriptions_base_path'); // only for single-user mode
+    const subscriptions_base_path = config_api.getConfigItem('ytdl_subscriptions_base_path');
     const multi_user_mode = config_api.getConfigItem('ytdl_multi_user_mode');
     const usersFileFolder = config_api.getConfigItem('ytdl_users_base_path');
     const subscriptions_enabled = config_api.getConfigItem('ytdl_allow_subscriptions');
@@ -185,7 +379,6 @@ exports.getFileDirectoriesAndDBs = async () => {
         for (let i = 0; i < users.length; i++) {
             const user = users[i];
 
-            // add user's audio dir to check list
             dirs_to_check.push({
                 basePath: path.join(usersFileFolder, user.uid, 'audio'),
                 user_uid: user.uid,
@@ -193,7 +386,6 @@ exports.getFileDirectoriesAndDBs = async () => {
                 archive_path: utils.getArchiveFolder('audio', user.uid)
             });
 
-            // add user's video dir to check list
             dirs_to_check.push({
                 basePath: path.join(usersFileFolder, user.uid, 'video'),
                 user_uid: user.uid,
@@ -205,14 +397,12 @@ exports.getFileDirectoriesAndDBs = async () => {
         const audioFolderPath = config_api.getConfigItem('ytdl_audio_folder_path');
         const videoFolderPath = config_api.getConfigItem('ytdl_video_folder_path');
 
-        // add audio dir to check list
         dirs_to_check.push({
             basePath: audioFolderPath,
             type: 'audio',
             archive_path: utils.getArchiveFolder('audio')
         });
 
-        // add video dir to check list
         dirs_to_check.push({
             basePath: videoFolderPath,
             type: 'video',
@@ -225,11 +415,9 @@ exports.getFileDirectoriesAndDBs = async () => {
         subscriptions_to_check = subscriptions_to_check.concat(subscriptions);
     }
 
-    // add subscriptions to check list
     for (let i = 0; i < subscriptions_to_check.length; i++) {
         let subscription_to_check = subscriptions_to_check[i];
         if (!subscription_to_check.name) {
-            // TODO: Remove subscription as it'll never complete
             continue;
         }
         dirs_to_check.push({
@@ -250,11 +438,32 @@ exports.getFileDirectoriesAndDBs = async () => {
 // Create
 
 exports.insertRecordIntoTable = async (table, doc, replaceFilter = null) => {
-    // local db override
     if (using_local_db) {
-        if (replaceFilter) local_db.get(table).remove((doc) => _.isMatch(doc, replaceFilter)).write();
-        local_db.get(table).push(doc).write();
-        return true;
+        try {
+            const pk = getPrimaryKeyColumn(table);
+            const keyCols = extractKeyColumns(table, doc);
+            
+            if (replaceFilter && pk && doc[pk] !== undefined) {
+                const existing = exports.getRecord(table, replaceFilter);
+                if (existing) {
+                    exports.removeRecord(table, replaceFilter);
+                }
+            } else if (replaceFilter) {
+                // If no PK but have filter, remove matching
+                exports.removeRecord(table, replaceFilter);
+            }
+
+            const cols = ['body', ...Object.keys(keyCols)];
+            const placeholders = cols.map(() => '?').join(',');
+            const values = [JSON.stringify(doc), ...Object.values(keyCols)];
+            
+            const sql = `INSERT INTO ${table} (${cols.join(',')}) VALUES (${placeholders})`;
+            local_db.prepare(sql).run(values);
+            return true;
+        } catch (err) {
+            logger.error(`insertRecordIntoTable error: ${err.message}`);
+            return false;
+        }
     }
 
     if (replaceFilter) {
@@ -280,18 +489,31 @@ exports.insertRecordIntoTable = async (table, doc, replaceFilter = null) => {
 }
 
 exports.insertRecordsIntoTable = async (table, docs, ignore_errors = false) => {
-    // local db override
     if (using_local_db) {
-        const records_limit = 30000;
-        if (docs.length < records_limit) {
-            local_db.get(table).push(...docs).write();
-        } else {
-            for (let i = 0; i < docs.length; i+=records_limit) {
-                const records_to_push = docs.slice(i, i+records_limit > docs.length ? docs.length : i+records_limit)
-                local_db.get(table).push(...records_to_push).write();
-            }
+        try {
+            const pk = getPrimaryKeyColumn(table);
+            const insert = local_db.transaction(() => {
+                for (const doc of docs) {
+                    const keyCols = extractKeyColumns(table, doc);
+                    const cols = ['body', ...Object.keys(keyCols)];
+                    const placeholders = cols.map(() => '?').join(',');
+                    const values = [JSON.stringify(doc), ...Object.values(keyCols)];
+                    
+                    const sql = `INSERT INTO ${table} (${cols.join(',')}) VALUES (${placeholders})`;
+                    try {
+                        local_db.prepare(sql).run(values);
+                    } catch (err) {
+                        if (!ignore_errors) throw err;
+                        // skip on ignore_errors
+                    }
+                }
+            });
+            insert();
+            return true;
+        } catch (err) {
+            logger.error(`insertRecordsIntoTable error: ${err.message}`);
+            return false;
         }
-        return true;
     }
     const output = await database.collection(table).insertMany(docs, {ordered: !ignore_errors});
     logger.debug(`Inserted ${output.insertedCount} docs into ${table}`);
@@ -299,47 +521,36 @@ exports.insertRecordsIntoTable = async (table, docs, ignore_errors = false) => {
 }
 
 exports.bulkInsertRecordsIntoTable = async (table, docs) => {
-    // local db override
-    if (using_local_db) {
-        return await exports.insertRecordsIntoTable(table, docs);
-    }
-
-    // not a necessary function as insertRecords does the same thing but gives us more control on batch size if needed
-    const table_collection = database.collection(table);
-        
-    let bulk = table_collection.initializeOrderedBulkOp(); // Initialize the Ordered Batch
-
-    for (let i = 0; i < docs.length; i++) {
-        bulk.insert(docs[i]);
-    }
-
-    const output = await bulk.execute();
-    return !!(output['result']['ok']);
-
+    return await exports.insertRecordsIntoTable(table, docs, false);
 }
 
 // Read
 
 exports.getRecord = async (table, filter_obj) => {
-    // local db override
     if (using_local_db) {
-        return exports.applyFilterLocalDB(local_db.get(table), filter_obj, 'find').value();
+        const { sql: whereSql, params } = buildWhereClause(filter_obj);
+        const sql = `SELECT * FROM ${table}${whereSql} LIMIT 1`;
+        const row = local_db.prepare(sql).get(params);
+        return docToObject(row);
     }
 
     return await database.collection(table).findOne(filter_obj);
 }
 
 exports.getRecords = async (table, filter_obj = null, return_count = false, sort = null, range = null) => {
-    // local db override
     if (using_local_db) {
-        let cursor = filter_obj ? exports.applyFilterLocalDB(local_db.get(table), filter_obj, 'filter').value() : local_db.get(table).value();
+        const { sql: whereSql, params } = buildWhereClause(filter_obj);
+        let sql = `SELECT * FROM ${table}${whereSql}`;
         if (sort) {
-            cursor = cursor.sort((a, b) => (a[sort['by']] > b[sort['by']] ? sort['order'] : sort['order']*-1));
+            const order = sort['order'] === 1 ? 'ASC' : 'DESC';
+            sql += ` ORDER BY ${sort['by']} ${order}`;
         }
         if (range) {
-            cursor = cursor.slice(range[0], range[1]);
+            sql += ` LIMIT ${range[1] - range[0]} OFFSET ${range[0]}`;
         }
-        return !return_count ? cursor : cursor.length;
+        const rows = local_db.prepare(sql).all(params);
+        if (return_count) return rows.length;
+        return rows.map(docToObject);
     }
 
     const cursor = filter_obj ? database.collection(table).find(filter_obj) : database.collection(table).find();
@@ -356,16 +567,48 @@ exports.getRecords = async (table, filter_obj = null, return_count = false, sort
 // Update
 
 exports.updateRecord = async (table, filter_obj, update_obj, nested_mode = false) => {
-    // local db override
     if (using_local_db) {
-        if (nested_mode) {
-            // if object is nested we need to handle it differently
-            update_obj = utils.convertFlatObjectToNestedObject(update_obj);
-            exports.applyFilterLocalDB(local_db.get(table), filter_obj, 'find').merge(update_obj).write();
+        try {
+            let actualUpdate = update_obj;
+            if (nested_mode) {
+                actualUpdate = utils.convertFlatObjectToNestedObject(update_obj);
+            }
+
+            const records = await exports.getRecords(table, filter_obj);
+            if (records.length === 0) return false;
+
+            const pk = getPrimaryKeyColumn(table);
+            
+            for (const record of records) {
+                const merged = { ...record, ...actualUpdate };
+                delete merged['_id'];
+
+                const keyCols = extractKeyColumns(table, merged);
+                
+                // Build SET clause for key columns + body
+                const setCols = ['body = ?'];
+                const setParams = [JSON.stringify(merged)];
+                for (const [k, v] of Object.entries(keyCols)) {
+                    setCols.push(`${k} = ?`);
+                    setParams.push(v);
+                }
+                
+                if (pk) {
+                    setParams.push(record[pk]);
+                    const sql = `UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`;
+                    local_db.prepare(sql).run(setParams);
+                } else {
+                    // No PK: use WHERE from filter
+                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj);
+                    const sql = `UPDATE ${table} SET ${setCols.join(', ')}${whereSql}`;
+                    local_db.prepare(sql).run([...setParams, ...whereParams]);
+                }
+            }
             return true;
+        } catch (err) {
+            logger.error(`updateRecord error: ${err.message}`);
+            return false;
         }
-        exports.applyFilterLocalDB(local_db.get(table), filter_obj, 'find').assign(update_obj).write();
-        return true;
     }
 
     // sometimes _id will be in the update obj, this breaks mongodb
@@ -375,17 +618,36 @@ exports.updateRecord = async (table, filter_obj, update_obj, nested_mode = false
 }
 
 exports.updateRecords = async (table, filter_obj, update_obj) => {
-    // local db override
     if (using_local_db) {
-        exports.applyFilterLocalDB(local_db.get(table), filter_obj, 'filter').each((record) => {
+        try {
+            const records = await exports.getRecords(table, filter_obj);
+            const pk = getPrimaryKeyColumn(table);
             const props_to_update = Object.keys(update_obj);
-            for (let i = 0; i < props_to_update.length; i++) {
-                const prop_to_update = props_to_update[i];
-                const prop_value = update_obj[prop_to_update];
-                record[prop_to_update] = prop_value;
+
+            for (const record of records) {
+                for (const prop of props_to_update) {
+                    record[prop] = update_obj[prop];
+                }
+                const keyCols = extractKeyColumns(table, record);
+                const setCols = ['body = ?'];
+                const setParams = [JSON.stringify(record)];
+                for (const [k, v] of Object.entries(keyCols)) {
+                    setCols.push(`${k} = ?`);
+                    setParams.push(v);
+                }
+                if (pk) {
+                    setParams.push(record[pk]);
+                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
+                } else {
+                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj);
+                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')}${whereSql}`).run([...setParams, ...whereParams]);
+                }
             }
-        }).write();
-        return true;
+            return true;
+        } catch (err) {
+            logger.error(`updateRecords error: ${err.message}`);
+            return false;
+        }
     }
 
     const output = await database.collection(table).updateMany(filter_obj, {$set: update_obj});
@@ -393,11 +655,36 @@ exports.updateRecords = async (table, filter_obj, update_obj) => {
 }
 
 exports.removePropertyFromRecord = async (table, filter_obj, remove_obj) => {
-    // local db override
     if (using_local_db) {
-        const props_to_remove = Object.keys(remove_obj);
-        exports.applyFilterLocalDB(local_db.get(table), filter_obj, 'find').unset(props_to_remove).write();
-        return true;
+        try {
+            const props_to_remove = Object.keys(remove_obj);
+            const records = await exports.getRecords(table, filter_obj);
+            const pk = getPrimaryKeyColumn(table);
+
+            for (const record of records) {
+                for (const prop of props_to_remove) {
+                    delete record[prop];
+                }
+                const keyCols = extractKeyColumns(table, record);
+                const setCols = ['body = ?'];
+                const setParams = [JSON.stringify(record)];
+                for (const [k, v] of Object.entries(keyCols)) {
+                    setCols.push(`${k} = ?`);
+                    setParams.push(v);
+                }
+                if (pk) {
+                    setParams.push(record[pk]);
+                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
+                } else {
+                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj);
+                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')}${whereSql}`).run([...setParams, ...whereParams]);
+                }
+            }
+            return true;
+        } catch (err) {
+            logger.error(`removePropertyFromRecord error: ${err.message}`);
+            return false;
+        }
     }
 
     const output = await database.collection(table).updateOne(filter_obj, {$unset: remove_obj});
@@ -405,25 +692,45 @@ exports.removePropertyFromRecord = async (table, filter_obj, remove_obj) => {
 }
 
 exports.bulkUpdateRecordsByKey = async (table, key_label, update_obj) => {
-    // local db override
     if (using_local_db) {
-        local_db.get(table).each((record) => {
-            const item_id_to_update = record[key_label];
-            if (!update_obj[item_id_to_update]) return;
+        try {
+            const item_ids_to_update = Object.keys(update_obj);
+            const records = await exports.getRecords(table);
+            
+            for (const record of records) {
+                const item_id_to_update = record[key_label];
+                if (!item_id_to_update || !update_obj[item_id_to_update]) continue;
 
-            const props_to_update = Object.keys(update_obj[item_id_to_update]);
-            for (let i = 0; i < props_to_update.length; i++) {
-                const prop_to_update = props_to_update[i];
-                const prop_value = update_obj[item_id_to_update][prop_to_update];
-                record[prop_to_update] = prop_value;
+                const props_to_update = Object.keys(update_obj[item_id_to_update]);
+                for (const prop of props_to_update) {
+                    record[prop] = update_obj[item_id_to_update][prop];
+                }
+
+                const keyCols = extractKeyColumns(table, record);
+                const setCols = ['body = ?'];
+                const setParams = [JSON.stringify(record)];
+                for (const [k, v] of Object.entries(keyCols)) {
+                    setCols.push(`${k} = ?`);
+                    setParams.push(v);
+                }
+                const pk = getPrimaryKeyColumn(table);
+                if (pk) {
+                    setParams.push(record[pk]);
+                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
+                } else {
+                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${key_label} = ?`).run(setParams.concat([item_id_to_update]));
+                }
             }
-        }).write();
-        return true;
+            return true;
+        } catch (err) {
+            logger.error(`bulkUpdateRecordsByKey error: ${err.message}`);
+            return false;
+        }
     }
 
     const table_collection = database.collection(table);
         
-    let bulk = table_collection.initializeOrderedBulkOp(); // Initialize the Ordered Batch
+    let bulk = table_collection.initializeOrderedBulkOp();
 
     const item_ids_to_update = Object.keys(update_obj);
 
@@ -439,10 +746,34 @@ exports.bulkUpdateRecordsByKey = async (table, key_label, update_obj) => {
 }
 
 exports.pushToRecordsArray = async (table, filter_obj, key, value) => {
-    // local db override
     if (using_local_db) {
-        exports.applyFilterLocalDB(local_db.get(table), filter_obj, 'find').get(key).push(value).write();
-        return true;
+        try {
+            const records = await exports.getRecords(table, filter_obj);
+            const pk = getPrimaryKeyColumn(table);
+            for (const record of records) {
+                if (!Array.isArray(record[key])) record[key] = [];
+                record[key].push(value);
+
+                const keyCols = extractKeyColumns(table, record);
+                const setCols = ['body = ?'];
+                const setParams = [JSON.stringify(record)];
+                for (const [k, v] of Object.entries(keyCols)) {
+                    setCols.push(`${k} = ?`);
+                    setParams.push(v);
+                }
+                if (pk) {
+                    setParams.push(record[pk]);
+                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
+                } else {
+                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj);
+                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')}${whereSql}`).run([...setParams, ...whereParams]);
+                }
+            }
+            return true;
+        } catch (err) {
+            logger.error(`pushToRecordsArray error: ${err.message}`);
+            return false;
+        }
     }
 
     const output = await database.collection(table).updateOne(filter_obj, {$push: {[key]: value}});
@@ -450,10 +781,34 @@ exports.pushToRecordsArray = async (table, filter_obj, key, value) => {
 }
 
 exports.pullFromRecordsArray = async (table, filter_obj, key, value) => {
-    // local db override
     if (using_local_db) {
-        exports.applyFilterLocalDB(local_db.get(table), filter_obj, 'find').get(key).pull(value).write();
-        return true;
+        try {
+            const records = await exports.getRecords(table, filter_obj);
+            const pk = getPrimaryKeyColumn(table);
+            for (const record of records) {
+                if (!Array.isArray(record[key])) record[key] = [];
+                record[key] = record[key].filter(item => item !== value);
+
+                const keyCols = extractKeyColumns(table, record);
+                const setCols = ['body = ?'];
+                const setParams = [JSON.stringify(record)];
+                for (const [k, v] of Object.entries(keyCols)) {
+                    setCols.push(`${k} = ?`);
+                    setParams.push(v);
+                }
+                if (pk) {
+                    setParams.push(record[pk]);
+                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
+                } else {
+                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj);
+                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')}${whereSql}`).run([...setParams, ...whereParams]);
+                }
+            }
+            return true;
+        } catch (err) {
+            logger.error(`pullFromRecordsArray error: ${err.message}`);
+            return false;
+        }
     }
 
     const output = await database.collection(table).updateOne(filter_obj, {$pull: {[key]: value}});
@@ -463,45 +818,58 @@ exports.pullFromRecordsArray = async (table, filter_obj, key, value) => {
 // Delete
 
 exports.removeRecord = async (table, filter_obj) => {
-    // local db override
     if (using_local_db) {
-        exports.applyFilterLocalDB(local_db.get(table), filter_obj, 'remove').write();
-        return true;
+        try {
+            const { sql: whereSql, params } = buildWhereClause(filter_obj);
+            local_db.prepare(`DELETE FROM ${table}${whereSql}`).run(params);
+            return true;
+        } catch (err) {
+            logger.error(`removeRecord error: ${err.message}`);
+            return false;
+        }
     }
 
     const output = await database.collection(table).deleteOne(filter_obj);
     return !!(output['result']['ok']);
 }
 
-// exports.removeRecordsByUIDBulk = async (table, uids) => {
-//     // local db override
-//     if (using_local_db) {
-//         exports.applyFilterLocalDB(local_db.get(table), filter_obj, 'remove').write();
-//         return true;
-//     }
+exports.removeAllRecords = async (table = null, filter_obj = null) => {
+    const tables_to_remove = table ? [table] : tables_list;
+    logger.debug(`Removing all records from: ${tables_to_remove} with filter: ${JSON.stringify(filter_obj)}`)
+    if (using_local_db) {
+        try {
+            for (const table_to_remove of tables_to_remove) {
+                if (filter_obj) {
+                    const { sql: whereSql, params } = buildWhereClause(filter_obj);
+                    local_db.prepare(`DELETE FROM ${table_to_remove}${whereSql}`).run(params);
+                } else {
+                    local_db.prepare(`DELETE FROM ${table_to_remove}`).run();
+                }
+                logger.debug(`Successfully removed records from ${table_to_remove}`);
+            }
+            return true;
+        } catch (err) {
+            logger.error(`removeAllRecords error: ${err.message}`);
+            return false;
+        }
+    }
 
-//     const table_collection = database.collection(table);
-        
-//     let bulk = table_collection.initializeOrderedBulkOp(); // Initialize the Ordered Batch
+    let success = true;
+    for (let i = 0; i < tables_to_remove.length; i++) {
+        const table_to_remove = tables_to_remove[i];
 
-//     const item_ids_to_remove = 
+        const output = await database.collection(table_to_remove).deleteMany(filter_obj ? filter_obj : {});
+        logger.debug(`Successfully removed records from ${table_to_remove}`);
+        success &= !!(output['result']['ok']);
+    }
+    return success;
+}
 
-//     for (let i = 0; i < item_ids_to_update.length; i++) {
-//         const item_id_to_update = item_ids_to_update[i];
-//         bulk.find({[key_label]: item_id_to_update }).updateOne({
-//             "$set": update_obj[item_id_to_update]
-//         });
-//     }
-
-//     const output = await bulk.execute();
-//     return !!(output['result']['ok']);
-// }
-
+// Query
 
 exports.findDuplicatesByKey = async (table, key) => {
     let duplicates = [];
     if (using_local_db) {
-        // this can probably be optimized
         const all_records = await exports.getRecords(table);
         const existing_records = {};
         for (let i = 0; i < all_records.length; i++) {
@@ -533,31 +901,6 @@ exports.findDuplicatesByKey = async (table, key) => {
     return duplicates;
 }
 
-exports.removeAllRecords = async (table = null, filter_obj = null) => {
-    // local db override
-    const tables_to_remove = table ? [table] : tables_list;
-    logger.debug(`Removing all records from: ${tables_to_remove} with filter: ${JSON.stringify(filter_obj)}`)
-    if (using_local_db) {
-        for (let i = 0; i < tables_to_remove.length; i++) {
-            const table_to_remove = tables_to_remove[i];
-            if (filter_obj) exports.applyFilterLocalDB(local_db.get(table), filter_obj, 'remove').write();
-            else local_db.assign({[table_to_remove]: []}).write();
-            logger.debug(`Successfully removed records from ${table_to_remove}`);
-        }
-        return true;
-    }
-
-    let success = true;
-    for (let i = 0; i < tables_to_remove.length; i++) {
-        const table_to_remove = tables_to_remove[i];
-
-        const output = await database.collection(table_to_remove).deleteMany(filter_obj ? filter_obj : {});
-        logger.debug(`Successfully removed records from ${table_to_remove}`);
-        success &= !!(output['result']['ok']);
-    }
-    return success;
-}
-
 // Stats
 
 exports.getDBStats = async () => {
@@ -573,9 +916,9 @@ exports.getDBStats = async () => {
 
 const getDBTableStats = async (table) => {
     const table_stats = {};
-    // local db override
     if (using_local_db) {
-        table_stats['records_count'] = local_db.get(table).value().length;
+        const row = local_db.prepare(`SELECT COUNT(*) as cnt FROM ${table}`).get();
+        table_stats['records_count'] = row ? row.cnt : 0;
     } else {
         const stats = await database.collection(table).stats();
         table_stats['records_count'] = stats.count;
@@ -618,7 +961,6 @@ exports.generateJSONTables = async (db_json, users_json) => {
 
     const tables_obj = {};
     
-    // TODO: use create*Records funcs to strip unnecessary properties
     tables_obj.files = createFilesRecords(files, subscriptions);
     tables_obj.playlists = playlists;
     tables_obj.categories = categories;
@@ -654,7 +996,7 @@ const createFilesRecords = (files, subscriptions) => {
         const subscription = subscriptions[i];
         if (!subscription['videos']) continue;
         subscription['videos'] = subscription['videos'].map(file => ({ ...file, sub_id: subscription['id'], user_uid: subscription['user_uid'] ? subscription['user_uid'] : undefined}));
-        files = files.concat(subscriptions[i]['videos']);
+        files = files.concat(subscription['videos']);
     }
 
     return files;
@@ -793,18 +1135,22 @@ exports.transferDB = async (local_to_remote) => {
 }
 
 /*
-    This function is necessary to emulate mongodb's ability to search for null or missing values.
-        A filter of null or undefined for a property will find docs that have that property missing, or have it
-        null or undefined. We want that same functionality for the local DB as well
-
-        error:    {$ne: null}
-          ^            ^
-          |            |
-      filter_prop  filter_prop_value
+    This function emulates MongoDB's ability to search for null or missing values,
+    regex, comparison operators, and nested dot-path properties.
+    Keep for backward compatibility with direct callers (tests use it).
 */
 exports.applyFilterLocalDB = (db_path, filter_obj, operation) => {
+    // Support being called with an array directly (test compatibility)
+    if (Array.isArray(db_path)) {
+        return applyFilterToCollection(db_path, filter_obj, operation);
+    }
+    // Otherwise treat as lowdb chain
+    return applyFilterToCollection(db_path.value(), filter_obj, operation);
+}
+
+function applyFilterToCollection(collection, filter_obj, operation) {
     const filter_props = Object.keys(filter_obj);
-    const return_val = db_path[operation](record => {
+    const filtered = collection.filter(record => {
         if (!filter_props) return true;
         let filtered = true;
         for (let i = 0; i < filter_props.length; i++) {
@@ -815,7 +1161,7 @@ exports.applyFilterLocalDB = (db_path, filter_obj, operation) => {
             } else {
                 if (typeof filter_prop_value === 'object') {
                     if ('$regex' in filter_prop_value) {
-                        filtered &= (record[filter_prop].search(new RegExp(filter_prop_value['$regex'], filter_prop_value['$options'])) !== -1);
+                        filtered &= (record[filter_prop] && record[filter_prop].search(new RegExp(filter_prop_value['$regex'], filter_prop_value['$options'])) !== -1);
                     } else if ('$ne' in filter_prop_value) {
                         filtered &= filter_prop in record && record[filter_prop] !== filter_prop_value['$ne'];
                     } else if ('$lt' in filter_prop_value) {
@@ -838,10 +1184,29 @@ exports.applyFilterLocalDB = (db_path, filter_obj, operation) => {
         }
         return filtered;
     });
-    return return_val;
+
+    if (operation === 'find') return filtered.length > 0 ? filtered[0] : null;
+    if (operation === 'remove') return filtered.length;
+    return filtered;
 }
 
 // should only be used for tests
 exports.setLocalDBMode = (mode) => {
     using_local_db = mode;
 }
+
+// Settings KV store (for auth.js compatibility)
+
+exports.getSetting = async (key) => {
+    if (using_local_db && local_db) {
+        const row = local_db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+        return row ? JSON.parse(row.value) : null;
+    }
+    return null;
+};
+
+exports.setSetting = async (key, value) => {
+    if (using_local_db && local_db) {
+        local_db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, JSON.stringify(value));
+    }
+};

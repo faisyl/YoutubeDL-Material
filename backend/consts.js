@@ -227,6 +227,14 @@ exports.CONFIG_ITEMS = {
         'key': 'ytdl_mongodb_connection_string',
         'path': 'YoutubeDLMaterial.Database.mongodb_connection_string'
     },
+    'ytdl_sqlite_path': {
+        'key': 'ytdl_sqlite_path',
+        'path': 'YoutubeDLMaterial.Database.sqlite_path'
+    },
+    'ytdl_auto_migrate_json': {
+        'key': 'ytdl_auto_migrate_json',
+        'path': 'YoutubeDLMaterial.Database.auto_migrate_json'
+    },
 
     // Advanced
     'ytdl_default_downloader': {

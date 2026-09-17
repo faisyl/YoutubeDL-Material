@@ -11,7 +11,7 @@ const archiver = require('archiver');
 const unzipper = require('unzipper');
 const db_api = require('./db');
 const utils = require('./utils')
-const low = require('lowdb')
+
 const fetch = require('node-fetch');
 const URL = require('url').URL;
 const CONSTS = require('./consts')
@@ -35,13 +35,13 @@ const notifications_api = require('./notifications');
 var app = express();
 
 // database setup
-const FileSync = require('lowdb/adapters/FileSync');
 
-const adapter = new FileSync('./appdata/db.json');
-const db = low(adapter)
 
-const users_adapter = new FileSync('./appdata/users.json');
-const users_db = low(users_adapter);
+
+
+
+
+;
 
 // env var setup
 
@@ -56,11 +56,11 @@ const admin_token = '4241b401-7236-493e-92b5-b72696b9d853';
 // logging setup
 
 config_api.initialize();
-db_api.initialize(db, users_db);
+db_api.initialize();
 auth_api.initialize(db_api);
 
 // Set some defaults
-db.defaults(
+
     {
         playlists: [],
         files: [],
@@ -72,7 +72,7 @@ db.defaults(
         archives_migration_complete: false
 }).write();
 
-users_db.defaults(
+users_
     {
         users: [],
         roles: {
@@ -165,90 +165,13 @@ app.use(auth_api.passport.session());
 // actual functions
 
 async function checkMigrations() {
-    // 4.1->4.2 migration
-    
-    const simplified_db_migration_complete = db.get('simplified_db_migration_complete').value();
-    if (!simplified_db_migration_complete) {
-        logger.info('Beginning migration: 4.1->4.2+')
-        let success = await simplifyDBFileStructure();
-        success = success && await files_api.addMetadataPropertyToDB('view_count');
-        success = success && await files_api.addMetadataPropertyToDB('description');
-        success = success && await files_api.addMetadataPropertyToDB('height');
-        success = success && await files_api.addMetadataPropertyToDB('abr');
-        // sets migration to complete
-        db.set('simplified_db_migration_complete', true).write();
-        if (success) { logger.info('4.1->4.2+ migration complete!'); }
-        else { logger.error('Migration failed: 4.1->4.2+'); }
-    }
-
-    const new_db_system_migration_complete = db.get('new_db_system_migration_complete').value();
-    if (!new_db_system_migration_complete) {
-        logger.info('Beginning migration: 4.2->4.3+')
-        let success = await db_api.importJSONToDB(db.value(), users_db.value());
-        await tasks_api.setupTasks(); // necessary as tasks were not properly initialized at first
-        // sets migration to complete
-        db.set('new_db_system_migration_complete', true).write();
-        if (success) { logger.info('4.2->4.3+ migration complete!'); }
-        else { logger.error('Migration failed: 4.2->4.3+'); }
-    }
-
-    const tasks_manager_role_migration_complete = db.get('tasks_manager_role_migration_complete').value();
-    if (!tasks_manager_role_migration_complete) {
-        logger.info('Checking if tasks manager role permissions exist for admin user...');
-        const success = await auth_api.changeRolePermissions('admin', 'tasks_manager', 'yes');
-        if (success) logger.info('Task manager permissions check complete!');
-        else logger.error('Failed to auto add tasks manager permissions to admin role!');
-        db.set('tasks_manager_role_migration_complete', true).write();
-    }
-
-    const archives_migration_complete = db.get('archives_migration_complete').value();
-    if (!archives_migration_complete) {
-        logger.info('Checking if archives have been migrated...');
-        const imported_archives = await archive_api.importArchives();
-        if (imported_archives) logger.info('Archives migration complete!');
-        else logger.error('Failed to migrate archives!');
-        db.set('archives_migration_complete', true).write();
-    }
-
+    // Historical migrations (4.1->4.2, 4.2->4.3) only apply to legacy JSON-based lowdb installs.
+    // When using SQLite, these migrations are not needed because the schema starts fresh.
+    // If legacy JSON files exist (pre-migration), they will be handled by db.js auto-migration.
     return true;
 }
 
-async function simplifyDBFileStructure() {
-    // back up db files
-    const old_db_file = fs.readJSONSync('./appdata/db.json');
-    const old_users_db_file = fs.readJSONSync('./appdata/users.json');
-    fs.writeJSONSync('appdata/db.old.json', old_db_file);
-    fs.writeJSONSync('appdata/users.old.json', old_users_db_file);
-
-    // simplify
-    let users = users_db.get('users').value();
-    for (let i = 0; i < users.length; i++) {
-        const user = users[i];
-        if (user['files']['video'] !== undefined && user['files']['audio'] !== undefined) {
-            const user_files = user['files']['video'].concat(user['files']['audio']);
-            const user_db_path = users_db.get('users').find({uid: user['uid']});
-            user_db_path.assign({files: user_files}).write();
-        }
-        if (user['playlists']['video'] !== undefined && user['playlists']['audio'] !== undefined) {
-            const user_playlists = user['playlists']['video'].concat(user['playlists']['audio']);
-            const user_db_path = users_db.get('users').find({uid: user['uid']});
-            user_db_path.assign({playlists: user_playlists}).write();
-        }
-    }
-
-    if (db.get('files.video').value() !== undefined && db.get('files.audio').value() !== undefined) {
-        const files = db.get('files.video').value().concat(db.get('files.audio').value());
-        db.assign({files: files}).write();
-    }
-
-    if (db.get('playlists.video').value() !== undefined && db.get('playlists.audio').value() !== undefined) {
-        const playlists = db.get('playlists.video').value().concat(db.get('playlists.audio').value());
-        db.assign({playlists: playlists}).write();
-    }
-    
-
-    return true;
-}
+// simplifyDBFileStructure removed - handled by db.js auto-migration
 
 async function startServer() {
     if (process.env.USING_HEROKU && process.env.PORT) {
