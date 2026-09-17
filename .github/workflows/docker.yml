@@ -39,7 +39,7 @@ jobs:
           if [ -n "$DH_USER" ] && [ -n "$DH_TOKEN" ]; then
             echo "dockerhub=true" >> $GITHUB_OUTPUT
             echo "repo=${DH_REPO:-${{ github.event.repository.name }}}" >> $GITHUB_OUTPUT
-            echo "images=ghcr.io/${{ github.repository_owner }}/${DH_REPO:-${{ github.event.repository.name }}}\n${DH_USER}/${DH_REPO:-${{ github.event.repository.name }}}" >> $GITHUB_OUTPUT
+            echo "images=ghcr.io/${{ github.repository_owner }}/${DH_REPO:-${{ github.event.repository.name }}},${DH_USER}/${DH_REPO:-${{ github.event.repository.name }}}" >> $GITHUB_OUTPUT
           else
             echo "dockerhub=false" >> $GITHUB_OUTPUT
             echo "repo=${DH_REPO:-${{ github.event.repository.name }}}" >> $GITHUB_OUTPUT
