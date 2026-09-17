@@ -108,9 +108,10 @@ function initSQLite(sqlitePath) {
     db.pragma('busy_timeout = 5000');
 
     // Register a regex UDF so $regex filters use real JS RegExp, not LIKE
-    db.function('regexp', (pattern, text) => {
+    // Supports optional flags (e.g. 'i' for case-insensitive)
+    db.function('regexp', (pattern, text, flags) => {
         try {
-            const re = new RegExp(pattern);
+            const re = new RegExp(pattern, flags || '');
             return re.test(text) ? 1 : 0;
         } catch (e) {
             return 0;
@@ -220,8 +221,10 @@ function buildWhereClause(filter_obj, table) {
         } else if (typeof filter_prop_value === 'object' && filter_prop_value !== null) {
             if ('$regex' in filter_prop_value) {
                 const regex = filter_prop_value['$regex'];
-                clauses.push(`regexp(?, ${col}) = 1`);
+                const options = filter_prop_value['$options'] || '';
+                clauses.push(`regexp(?, ${col}, ?) = 1`);
                 params.push(regex);
+                params.push(options);
             } else if ('$ne' in filter_prop_value) {
                 const val = filter_prop_value['$ne'];
                 if (val === null || val === undefined) {
