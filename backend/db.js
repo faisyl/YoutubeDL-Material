@@ -779,7 +779,14 @@ exports.bulkUpdateRecordsByKey = async (table, key_label, update_obj) => {
                     setParams.push(bindValue(record[pk]));
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
                 } else {
-                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${key_label} = ?`).run(setParams.concat([bindValue(item_id_to_update)]));
+                    // No PK: resolve key_label via schema-aware lookup (real column or json_extract)
+                    const realCols = getTableColumns(table);
+                    const keyCol = realCols.has(key_label) ? key_label : null;
+                    if (keyCol) {
+                        local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${key_label} = ?`).run(setParams.concat([bindValue(item_id_to_update)]));
+                    } else {
+                        local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE json_extract(body, '${jsonExtractPath(key_label)}') = ?`).run(setParams.concat([bindValue(item_id_to_update)]));
+                    }
                 }
             }
             return true;
