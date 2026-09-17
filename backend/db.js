@@ -182,6 +182,15 @@ function getTableColumns(table) {
     return cols;
 }
 
+// Coerce JS values to SQLite-bindable types
+// better-sqlite3 can only bind: numbers, strings, bigints, buffers, null
+function bindValue(v) {
+    if (typeof v === 'boolean') return v ? 1 : 0;
+    if (v === undefined) return null;
+    if (v !== null && typeof v === 'object') return JSON.stringify(v);
+    return v;
+}
+
 function buildWhereClause(filter_obj, table) {
     if (!filter_obj) return { sql: '', params: [] };
     const filter_props = Object.keys(filter_obj);
@@ -219,28 +228,28 @@ function buildWhereClause(filter_obj, table) {
                     clauses.push(`(${col} IS NOT NULL AND json_type(${col}) != 'null')`);
                 } else {
                     clauses.push(`(${col} != ? OR ${col} IS NULL)`);
-                    params.push(typeof val === 'object' ? JSON.stringify(val) : val);
+                    params.push(bindValue(val));
                 }
             } else if ('$lt' in filter_prop_value) {
                 clauses.push(`${col} < ?`);
-                params.push(typeof filter_prop_value['$lt'] === 'object' ? JSON.stringify(filter_prop_value['$lt']) : filter_prop_value['$lt']);
+                params.push(bindValue(filter_prop_value['$lt']));
             } else if ('$gt' in filter_prop_value) {
                 clauses.push(`${col} > ?`);
-                params.push(typeof filter_prop_value['$gt'] === 'object' ? JSON.stringify(filter_prop_value['$gt']) : filter_prop_value['$gt']);
+                params.push(bindValue(filter_prop_value['$gt']));
             } else if ('$lte' in filter_prop_value) {
                 clauses.push(`${col} <= ?`);
-                params.push(typeof filter_prop_value['$lte'] === 'object' ? JSON.stringify(filter_prop_value['$lte']) : filter_prop_value['$lte']);
+                params.push(bindValue(filter_prop_value['$lte']));
             } else if ('$gte' in filter_prop_value) {
                 clauses.push(`${col} >= ?`);
-                params.push(typeof filter_prop_value['$gte'] === 'object' ? JSON.stringify(filter_prop_value['$gte']) : filter_prop_value['$gte']);
+                params.push(bindValue(filter_prop_value['$gte']));
             } else {
                 // Non-operator object: serialize and match against json_extract
                 clauses.push(`${col} = ?`);
-                params.push(JSON.stringify(filter_prop_value));
+                params.push(bindValue(filter_prop_value));
             }
         } else {
             clauses.push(`${col} = ?`);
-            params.push(filter_prop_value);
+            params.push(bindValue(filter_prop_value));
         }
     }
 
@@ -312,7 +321,7 @@ exports.initialize = (input_db, input_users_db, db_name = 'local_db.json') => {
                                 }
                                 const cols = ['body', ...Object.keys(keyValues)];
                                 const placeholders = cols.map(() => '?').join(',');
-                                const values = [JSON.stringify(doc), ...Object.values(keyValues)];
+                                const values = [JSON.stringify(doc), ...Object.values(keyValues).map(bindValue)];
                                 local_db.prepare(`INSERT OR IGNORE INTO ${table_key} (${cols.join(',')}) VALUES (${placeholders})`).run(values);
                             }
                         }
@@ -507,7 +516,7 @@ exports.insertRecordIntoTable = async (table, doc, replaceFilter = null) => {
 
             const cols = ['body', ...Object.keys(keyCols)];
             const placeholders = cols.map(() => '?').join(',');
-            const values = [JSON.stringify(doc), ...Object.values(keyCols)];
+            const values = [JSON.stringify(doc), ...Object.values(keyCols).map(bindValue)];
             
             const sql = `INSERT INTO ${table} (${cols.join(',')}) VALUES (${placeholders})`;
             local_db.prepare(sql).run(values);
@@ -642,7 +651,7 @@ exports.updateRecord = async (table, filter_obj, update_obj, nested_mode = false
                 const setParams = [JSON.stringify(merged)];
                 for (const [k, v] of Object.entries(keyCols)) {
                     setCols.push(`${k} = ?`);
-                    setParams.push(v);
+                    setParams.push(bindValue(v));
                 }
                 
                 if (pk) {
@@ -685,10 +694,10 @@ exports.updateRecords = async (table, filter_obj, update_obj) => {
                 const setParams = [JSON.stringify(record)];
                 for (const [k, v] of Object.entries(keyCols)) {
                     setCols.push(`${k} = ?`);
-                    setParams.push(v);
+                    setParams.push(bindValue(v));
                 }
                 if (pk) {
-                    setParams.push(record[pk]);
+                    setParams.push(bindValue(record[pk]));
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
                 } else {
                     const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj, table);
@@ -763,14 +772,14 @@ exports.bulkUpdateRecordsByKey = async (table, key_label, update_obj) => {
                 const setParams = [JSON.stringify(record)];
                 for (const [k, v] of Object.entries(keyCols)) {
                     setCols.push(`${k} = ?`);
-                    setParams.push(v);
+                    setParams.push(bindValue(v));
                 }
                 const pk = getPrimaryKeyColumn(table);
                 if (pk) {
-                    setParams.push(record[pk]);
+                    setParams.push(bindValue(record[pk]));
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
                 } else {
-                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${key_label} = ?`).run(setParams.concat([item_id_to_update]));
+                    local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${key_label} = ?`).run(setParams.concat([bindValue(item_id_to_update)]));
                 }
             }
             return true;
@@ -811,10 +820,10 @@ exports.pushToRecordsArray = async (table, filter_obj, key, value) => {
                 const setParams = [JSON.stringify(record)];
                 for (const [k, v] of Object.entries(keyCols)) {
                     setCols.push(`${k} = ?`);
-                    setParams.push(v);
+                    setParams.push(bindValue(v));
                 }
                 if (pk) {
-                    setParams.push(record[pk]);
+                    setParams.push(bindValue(record[pk]));
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
                 } else {
                     const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj, table);
@@ -846,10 +855,10 @@ exports.pullFromRecordsArray = async (table, filter_obj, key, value) => {
                 const setParams = [JSON.stringify(record)];
                 for (const [k, v] of Object.entries(keyCols)) {
                     setCols.push(`${k} = ?`);
-                    setParams.push(v);
+                    setParams.push(bindValue(v));
                 }
                 if (pk) {
-                    setParams.push(record[pk]);
+                    setParams.push(bindValue(record[pk]));
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
                 } else {
                     const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj, table);
