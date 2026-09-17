@@ -167,25 +167,39 @@ function jsonExtractPath(key) {
     return path;
 }
 
-function buildWhereClause(filter_obj) {
+// Get the list of real (materialized) columns for a table
+function getTableColumns(table) {
+    const cols = new Set();
+    const tableDef = tables[table];
+    if (tableDef && tableDef.primary_key) {
+        cols.add(tableDef.primary_key);
+    }
+    if (tableDef && tableDef.text_search) {
+        for (const col of Object.keys(tableDef.text_search)) {
+            cols.add(col);
+        }
+    }
+    return cols;
+}
+
+function buildWhereClause(filter_obj, table) {
     if (!filter_obj) return { sql: '', params: [] };
     const filter_props = Object.keys(filter_obj);
     if (filter_props.length === 0) return { sql: '', params: [] };
 
+    const realCols = table ? getTableColumns(table) : new Set();
     const clauses = [];
     const params = [];
 
     for (const filter_prop of filter_props) {
         const filter_prop_value = filter_obj[filter_prop];
         const isDotPath = filter_prop.includes('.');
-        const colRef = isDotPath ? `json_extract(body, '${jsonExtractPath(filter_prop)}')` : 
-                      (filter_prop in (tables.files.primary_key ? {} : {}) ? filter_prop : null);
 
-        // determine column reference
+        // Determine column reference: use real column if it exists, otherwise json_extract from body
         let col;
         if (isDotPath) {
             col = `json_extract(body, '${jsonExtractPath(filter_prop)}')`;
-        } else if (['uid','id','key','title','uploader'].includes(filter_prop)) {
+        } else if (realCols.has(filter_prop)) {
             col = filter_prop;
         } else {
             col = `json_extract(body, '${jsonExtractPath(filter_prop)}')`;
@@ -193,35 +207,36 @@ function buildWhereClause(filter_obj) {
 
         if (filter_prop_value === undefined || filter_prop_value === null) {
             // null/undefined: match missing or null
-            clauses.push(`(${col} IS NULL OR json_type(${col}) = 'null' OR json_extract(body, '${jsonExtractPath(filter_prop)}' ) IS NULL)`);
+            clauses.push(`(${col} IS NULL OR json_type(${col}) = 'null')`);
         } else if (typeof filter_prop_value === 'object' && filter_prop_value !== null) {
             if ('$regex' in filter_prop_value) {
                 const regex = filter_prop_value['$regex'];
-                const options = filter_prop_value['$options'] || '';
-                if (options.includes('i')) {
-                    // Unicode-aware case-insensitive regex
-                    clauses.push(`regexp(?, ${col}) = 1`);
-                    params.push(regex);
-                } else {
-                    // Case-sensitive regex
-                    clauses.push(`regexp(?, ${col}) = 1`);
-                    params.push(regex);
-                }
+                clauses.push(`regexp(?, ${col}) = 1`);
+                params.push(regex);
             } else if ('$ne' in filter_prop_value) {
-                clauses.push(`(${col} != ? OR ${col} IS NULL)`);
-                params.push(filter_prop_value['$ne']);
+                const val = filter_prop_value['$ne'];
+                if (val === null || val === undefined) {
+                    clauses.push(`(${col} IS NOT NULL AND json_type(${col}) != 'null')`);
+                } else {
+                    clauses.push(`(${col} != ? OR ${col} IS NULL)`);
+                    params.push(typeof val === 'object' ? JSON.stringify(val) : val);
+                }
             } else if ('$lt' in filter_prop_value) {
                 clauses.push(`${col} < ?`);
-                params.push(filter_prop_value['$lt']);
+                params.push(typeof filter_prop_value['$lt'] === 'object' ? JSON.stringify(filter_prop_value['$lt']) : filter_prop_value['$lt']);
             } else if ('$gt' in filter_prop_value) {
                 clauses.push(`${col} > ?`);
-                params.push(filter_prop_value['$gt']);
+                params.push(typeof filter_prop_value['$gt'] === 'object' ? JSON.stringify(filter_prop_value['$gt']) : filter_prop_value['$gt']);
             } else if ('$lte' in filter_prop_value) {
                 clauses.push(`${col} <= ?`);
-                params.push(filter_prop_value['$lte']);
+                params.push(typeof filter_prop_value['$lte'] === 'object' ? JSON.stringify(filter_prop_value['$lte']) : filter_prop_value['$lte']);
             } else if ('$gte' in filter_prop_value) {
                 clauses.push(`${col} >= ?`);
-                params.push(filter_prop_value['$gte']);
+                params.push(typeof filter_prop_value['$gte'] === 'object' ? JSON.stringify(filter_prop_value['$gte']) : filter_prop_value['$gte']);
+            } else {
+                // Non-operator object: serialize and match against json_extract
+                clauses.push(`${col} = ?`);
+                params.push(JSON.stringify(filter_prop_value));
             }
         } else {
             clauses.push(`${col} = ?`);
@@ -565,7 +580,7 @@ exports.bulkInsertRecordsIntoTable = async (table, docs) => {
 
 exports.getRecord = async (table, filter_obj) => {
     if (using_local_db) {
-        const { sql: whereSql, params } = buildWhereClause(filter_obj);
+        const { sql: whereSql, params } = buildWhereClause(filter_obj, table);
         const sql = `SELECT * FROM ${table}${whereSql} LIMIT 1`;
         const row = local_db.prepare(sql).get(params);
         return docToObject(row);
@@ -576,7 +591,7 @@ exports.getRecord = async (table, filter_obj) => {
 
 exports.getRecords = async (table, filter_obj = null, return_count = false, sort = null, range = null) => {
     if (using_local_db) {
-        const { sql: whereSql, params } = buildWhereClause(filter_obj);
+        const { sql: whereSql, params } = buildWhereClause(filter_obj, table);
         let sql = `SELECT * FROM ${table}${whereSql}`;
         if (sort) {
             const order = sort['order'] === 1 ? 'ASC' : 'DESC';
@@ -636,7 +651,7 @@ exports.updateRecord = async (table, filter_obj, update_obj, nested_mode = false
                     local_db.prepare(sql).run(setParams);
                 } else {
                     // No PK: use WHERE from filter
-                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj);
+                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj, table);
                     const sql = `UPDATE ${table} SET ${setCols.join(', ')}${whereSql}`;
                     local_db.prepare(sql).run([...setParams, ...whereParams]);
                 }
@@ -676,7 +691,7 @@ exports.updateRecords = async (table, filter_obj, update_obj) => {
                     setParams.push(record[pk]);
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
                 } else {
-                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj);
+                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj, table);
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')}${whereSql}`).run([...setParams, ...whereParams]);
                 }
             }
@@ -713,7 +728,7 @@ exports.removePropertyFromRecord = async (table, filter_obj, remove_obj) => {
                     setParams.push(record[pk]);
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
                 } else {
-                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj);
+                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj, table);
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')}${whereSql}`).run([...setParams, ...whereParams]);
                 }
             }
@@ -802,7 +817,7 @@ exports.pushToRecordsArray = async (table, filter_obj, key, value) => {
                     setParams.push(record[pk]);
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
                 } else {
-                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj);
+                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj, table);
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')}${whereSql}`).run([...setParams, ...whereParams]);
                 }
             }
@@ -837,7 +852,7 @@ exports.pullFromRecordsArray = async (table, filter_obj, key, value) => {
                     setParams.push(record[pk]);
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')} WHERE ${pk} = ?`).run(setParams);
                 } else {
-                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj);
+                    const { sql: whereSql, params: whereParams } = buildWhereClause(filter_obj, table);
                     local_db.prepare(`UPDATE ${table} SET ${setCols.join(', ')}${whereSql}`).run([...setParams, ...whereParams]);
                 }
             }
@@ -857,7 +872,7 @@ exports.pullFromRecordsArray = async (table, filter_obj, key, value) => {
 exports.removeRecord = async (table, filter_obj) => {
     if (using_local_db) {
         try {
-            const { sql: whereSql, params } = buildWhereClause(filter_obj);
+            const { sql: whereSql, params } = buildWhereClause(filter_obj, table);
             local_db.prepare(`DELETE FROM ${table}${whereSql}`).run(params);
             return true;
         } catch (err) {
@@ -877,7 +892,7 @@ exports.removeAllRecords = async (table = null, filter_obj = null) => {
         try {
             for (const table_to_remove of tables_to_remove) {
                 if (filter_obj) {
-                    const { sql: whereSql, params } = buildWhereClause(filter_obj);
+                    const { sql: whereSql, params } = buildWhereClause(filter_obj, table_to_remove);
                     local_db.prepare(`DELETE FROM ${table_to_remove}${whereSql}`).run(params);
                 } else {
                     local_db.prepare(`DELETE FROM ${table_to_remove}`).run();
