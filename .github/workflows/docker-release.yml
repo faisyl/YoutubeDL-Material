@@ -9,6 +9,10 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -16,6 +20,23 @@ jobs:
     steps:
       - name: checkout code
         uses: actions/checkout@v4
+
+      - name: Detect DockerHub credentials
+        id: creds
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DH_REPO: ${{ secrets.DOCKERHUB_REPO }}
+        run: |
+          if [ -n "$DH_USER" ] && [ -n "$DH_TOKEN" ]; then
+            echo "dockerhub=true" >> $GITHUB_OUTPUT
+            echo "repo=${DH_REPO:-${{ github.event.repository.name }}}" >> $GITHUB_OUTPUT
+            echo "images=ghcr.io/${{ github.repository_owner }}/${DH_REPO:-${{ github.event.repository.name }}}\n${DH_USER}/${DH_REPO:-${{ github.event.repository.name }}}" >> $GITHUB_OUTPUT
+          else
+            echo "dockerhub=false" >> $GITHUB_OUTPUT
+            echo "repo=${DH_REPO:-${{ github.event.repository.name }}}" >> $GITHUB_OUTPUT
+            echo "images=ghcr.io/${{ github.repository_owner }}/${DH_REPO:-${{ github.event.repository.name }}}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Set hash
         id: vars
@@ -49,9 +70,7 @@ jobs:
         id: docker-meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/${{ secrets.DOCKERHUB_REPO }}
-            ghcr.io/${{ github.repository_owner }}/${{ secrets.DOCKERHUB_REPO }}
+          images: ${{ steps.creds.outputs.images }}
           tags: |
             type=raw,value=${{ steps.tags.outputs.tags }}
             type=raw,value=latest
@@ -63,6 +82,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to DockerHub
+        if: steps.creds.outputs.dockerhub == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
