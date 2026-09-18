@@ -8,7 +8,7 @@ RUN sh ./ffmpeg-fetch.sh
 RUN sh ./fetch-twitchdownloader.sh
 
 
-# Create our Ubuntu 22.04 with node 16.14.2 (that specific version is required as per: https://stackoverflow.com/a/72855258/8088021)
+# Create our Ubuntu 22.04 with node 22.14.0 (LTS)
 # Go to 20.04
 FROM ubuntu:22.04 AS base
 ARG TARGETPLATFORM
