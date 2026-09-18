@@ -601,13 +601,26 @@ exports.getRecord = async (table, filter_obj) => {
     return await database.collection(table).findOne(filter_obj);
 }
 
-exports.getRecords = async (table, filter_obj = null, return_count = false, sort = null, range = null) => {
+exports.getRecords = async (table, filter_obj = null, return_count = false, sort = null, range = null, text_search = null) => {
     if (using_local_db) {
         const { sql: whereSql, params } = buildWhereClause(filter_obj, table);
-        let sql = `SELECT * FROM ${table}${whereSql}`;
+        let whereClause = whereSql;
+        if (text_search) {
+            const searchCols = tables[table] && tables[table].text_search ? Object.keys(tables[table].text_search) : [];
+            if (searchCols.length > 0) {
+                const searchClauses = searchCols.map(col => `unicode_lower(${col}) LIKE ?`).join(' OR ');
+                whereClause += (whereClause ? ' AND ' : ' WHERE ') + `(${searchClauses})`;
+                const term = `%${text_search.toLocaleLowerCase()}%`;
+                for (let i = 0; i < searchCols.length; i++) params.push(term);
+            }
+        }
+        let sql = `SELECT * FROM ${table}${whereClause}`;
         if (sort) {
             const order = sort['order'] === 1 ? 'ASC' : 'DESC';
-            sql += ` ORDER BY ${sort['by']} ${order}`;
+            const sortBy = sort['by'];
+            const realCols = getTableColumns(table);
+            const sortCol = realCols.has(sortBy) ? sortBy : `json_extract(body, '${jsonExtractPath(sortBy)}')`;
+            sql += ` ORDER BY ${sortCol} ${order}`;
         }
         if (range) {
             sql += ` LIMIT ${range[1] - range[0]} OFFSET ${range[0]}`;

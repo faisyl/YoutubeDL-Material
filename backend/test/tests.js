@@ -312,6 +312,71 @@ describe('Database', async function() {
 
                     assert(success);
                 });
+
+                it('Sort by nested field does not throw', async function() {
+                    await db_api.removeAllRecords('files');
+                    const file1 = {uid: 'sort-test-1', title: 'Alpha', uploader: 'User1', registered: 3000};
+                    const file2 = {uid: 'sort-test-2', title: 'Beta', uploader: 'User2', registered: 1000};
+                    const file3 = {uid: 'sort-test-3', title: 'Gamma', uploader: 'User3', registered: 2000};
+                    await db_api.insertRecordIntoTable('files', file1);
+                    await db_api.insertRecordIntoTable('files', file2);
+                    await db_api.insertRecordIntoTable('files', file3);
+
+                    const records = await db_api.getRecords('files', null, false, {by: 'registered', order: -1});
+                    assert.strictEqual(records.length, 3);
+                    assert.strictEqual(records[0].registered, 3000);
+                    assert.strictEqual(records[1].registered, 2000);
+                    assert.strictEqual(records[2].registered, 1000);
+
+                    await db_api.removeAllRecords('files');
+                });
+
+                it('Sort by real column still works', async function() {
+                    await db_api.removeAllRecords('files');
+                    const file1 = {uid: 'sort-real-1', title: 'Zeta', uploader: 'User1'};
+                    const file2 = {uid: 'sort-real-2', title: 'Alpha', uploader: 'User2'};
+                    await db_api.insertRecordIntoTable('files', file1);
+                    await db_api.insertRecordIntoTable('files', file2);
+
+                    const records = await db_api.getRecords('files', null, false, {by: 'title', order: 1});
+                    assert.strictEqual(records.length, 2);
+                    assert.strictEqual(records[0].title, 'Alpha');
+                    assert.strictEqual(records[1].title, 'Zeta');
+
+                    await db_api.removeAllRecords('files');
+                });
+
+                it('text_search filters results', async function() {
+                    await db_api.removeAllRecords('files');
+                    const file1 = {uid: 'search-1', title: 'My Vacation Video', uploader: 'Traveler'};
+                    const file2 = {uid: 'search-2', title: 'Cooking Tutorial', uploader: 'Chef'};
+                    const file3 = {uid: 'search-3', title: 'Another Vacation', uploader: 'Traveler'};
+                    await db_api.insertRecordIntoTable('files', file1);
+                    await db_api.insertRecordIntoTable('files', file2);
+                    await db_api.insertRecordIntoTable('files', file3);
+
+                    const records = await db_api.getRecords('files', null, false, null, null, 'vacation');
+                    assert.strictEqual(records.length, 2);
+
+                    await db_api.removeAllRecords('files');
+                });
+
+                it('text_search combined with sort does not throw', async function() {
+                    await db_api.removeAllRecords('files');
+                    const file1 = {uid: 'combo-1', title: 'Alpha Video', uploader: 'User1', registered: 3000};
+                    const file2 = {uid: 'combo-2', title: 'Beta Tutorial', uploader: 'AlphaChannel', registered: 1000};
+                    const file3 = {uid: 'combo-3', title: 'Another Clip', uploader: 'User3', registered: 2000};
+                    await db_api.insertRecordIntoTable('files', file1);
+                    await db_api.insertRecordIntoTable('files', file2);
+                    await db_api.insertRecordIntoTable('files', file3);
+
+                    const records = await db_api.getRecords('files', null, false, {by: 'registered', order: -1}, null, 'alpha');
+                    assert.strictEqual(records.length, 2);
+                    assert.strictEqual(records[0].uid, 'combo-1');
+                    assert.strictEqual(records[1].uid, 'combo-2');
+
+                    await db_api.removeAllRecords('files');
+                });
             });
         }
     });
