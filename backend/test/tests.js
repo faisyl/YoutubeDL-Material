@@ -360,6 +360,23 @@ describe('Database', async function() {
 
                     await db_api.removeAllRecords('files');
                 });
+
+                it('text_search combined with sort does not throw', async function() {
+                    await db_api.removeAllRecords('files');
+                    const file1 = {uid: 'combo-1', title: 'Alpha Video', uploader: 'User1', registered: 3000};
+                    const file2 = {uid: 'combo-2', title: 'Beta Tutorial', uploader: 'AlphaChannel', registered: 1000};
+                    const file3 = {uid: 'combo-3', title: 'Another Clip', uploader: 'User3', registered: 2000};
+                    await db_api.insertRecordIntoTable('files', file1);
+                    await db_api.insertRecordIntoTable('files', file2);
+                    await db_api.insertRecordIntoTable('files', file3);
+
+                    const records = await db_api.getRecords('files', null, false, {by: 'registered', order: -1}, null, 'alpha');
+                    assert.strictEqual(records.length, 2);
+                    assert.strictEqual(records[0].uid, 'combo-1');
+                    assert.strictEqual(records[1].uid, 'combo-2');
+
+                    await db_api.removeAllRecords('files');
+                });
             });
         }
     });
